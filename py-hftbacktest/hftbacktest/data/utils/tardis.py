@@ -1,5 +1,5 @@
 import gzip
-from typing import List, Optional, Literal, Any
+from typing import List, Optional, Literal, Dict
 
 import numpy as np
 import polars as pl
@@ -53,6 +53,128 @@ book_ticker_schema = {
 }
 
 
+def _infer_file_type(file: str) -> str:
+    if 'trades' in file:
+        return 'trades'
+    elif 'incremental_book_L2' in file:
+        return 'depth'
+    elif 'book_ticker' in file:
+        return 'book_ticker'
+    else:
+        # Attempts to infer the file type using its header.
+        try:
+            if file.endswith('.gz'):
+                with gzip.open(file) as f:
+                    line = f.readline()
+                    header = line.decode().strip().split(',')
+            else:
+                with open(file) as f:
+                    line = f.readline()
+                    header = line.strip().split(',')
+            if header == list(trade_schema.keys()):
+                return 'trades'
+            elif header == list(depth_schema.keys()):
+                return 'depth'
+            elif header == list(book_ticker_schema.keys()):
+                return 'book_ticker'
+        except:
+            pass
+    raise ValueError(f'Unknown file format: {file}')
+
+
+def _build_trades_lazy(files: List[str]) -> pl.LazyFrame:
+    return (
+        pl.scan_csv(files, schema=trade_schema)
+        .with_columns(
+            pl.when(pl.col('side') == 'buy')
+            .then(BUY_EVENT | TRADE_EVENT)
+            .when(pl.col('side') == 'sell')
+            .then(SELL_EVENT | TRADE_EVENT)
+            .otherwise(TRADE_EVENT)
+            .cast(pl.UInt64, strict=True)
+            .alias('ev'),
+            (pl.col('timestamp') * 1000)
+            .cast(pl.Int64, strict=True)
+            .alias('exch_ts'),
+            (pl.col('local_timestamp') * 1000)
+            .cast(pl.Int64, strict=True)
+            .alias('local_ts'),
+            pl.col('price')
+            .cast(pl.Float64, strict=True)
+            .alias('px'),
+            pl.col('amount')
+            .cast(pl.Float64, strict=True)
+            .alias('qty'),
+            pl.lit(0)
+            .cast(pl.UInt64, strict=True)
+            .alias('order_id'),
+            pl.lit(0)
+            .cast(pl.Int64, strict=True)
+            .alias('ival'),
+            pl.lit(0.0)
+            .cast(pl.Float64, strict=True)
+            .alias('fval')
+        )
+        .select(['ev', 'exch_ts', 'local_ts', 'px', 'qty', 'order_id', 'ival', 'fval'])
+    )
+
+
+def _build_depth_lazy(files: List[str]) -> pl.LazyFrame:
+    return (
+        pl.scan_csv(files, schema=depth_schema)
+        .with_columns(
+            (pl.col('timestamp') * 1000)
+            .cast(pl.Int64, strict=True)
+            .alias('exch_ts'),
+            (pl.col('local_timestamp') * 1000)
+            .cast(pl.Int64, strict=True)
+            .alias('local_ts'),
+            pl.col('price')
+            .cast(pl.Float64, strict=True)
+            .alias('px'),
+            pl.col('amount')
+            .cast(pl.Float64, strict=True)
+            .alias('qty'),
+            pl.when((pl.col('side') == 'bid') | (pl.col('side') == 'buy'))
+            .then(1)
+            .when((pl.col('side') == 'ask') | (pl.col('side') == 'sell'))
+            .then(-1)
+            .otherwise(0)
+            .cast(pl.Int8, strict=True)
+            .alias('side'),
+            pl.when(pl.col('is_snapshot'))
+            .then(1)
+            .otherwise(0)
+            .cast(pl.Int8, strict=True)
+            .alias('is_snapshot')
+        )
+        .select(['exch_ts', 'local_ts', 'px', 'qty', 'side', 'is_snapshot'])
+    )
+
+
+def _build_ticker_lazy(files: List[str]) -> pl.LazyFrame:
+    return (
+        pl.scan_csv(files, schema=book_ticker_schema)
+        .with_columns(
+            (pl.col('timestamp') * 1000)
+            .cast(pl.Int64, strict=True)
+            .alias('exch_ts'),
+            (pl.col('local_timestamp') * 1000)
+            .cast(pl.Int64, strict=True)
+            .alias('local_ts'),
+            pl.col('ask_amount')
+            .cast(pl.Float64, strict=True),
+            pl.col('ask_price')
+            .cast(pl.Float64, strict=True),
+            pl.col('bid_price')
+            .cast(pl.Float64, strict=True),
+            pl.col('bid_amount')
+            .cast(pl.Float64, strict=True),
+        )
+        .select(['exch_ts', 'local_ts', 'ask_amount', 'ask_price', 'bid_price', 'bid_amount'])
+    )
+
+
 def convert(
         input_files: List[str],
         output_filename: Optional[str] = None,
@@ -100,115 +222,38 @@ def convert(
 
     row_num = 0
 
+    snapshot_mode_flag = 0
+    if snapshot_mode == 'ignore':
+        snapshot_mode_flag = SNAPSHOT_MODE_IGNORE
+    elif snapshot_mode == 'ignore_sod':
+        snapshot_mode_flag = SNAPSHOT_MODE_IGNORE_SOD
+
+    grouped_files: Dict[str, List[str]] = {'trades': [], 'depth': [], 'book_ticker': []}
     for file in input_files:
-        print('Reading %s' % file)
+        ftype = _infer_file_type(file)
+        grouped_files[ftype].append(file)
 
-        schema = None
-        if 'trades' in file:
-            schema = trade_schema
-        elif 'incremental_book_L2' in file:
-            schema = depth_schema
-        elif 'book_ticker' in file:
-            schema = book_ticker_schema
-        else:
-            # Attempts to infer the file type using its header.
-            try:
-                if file.endswith('.gz'):
-                    with gzip.open(file) as f:
-                        line = f.readline()
-                        header = line.decode().strip().split(',')
-                else:
-                    with open(file) as f:
-                        line = f.readline()
-                        header = line.strip().split(',')
-                if header == list(trade_schema.keys()):
-                    schema = trade_schema
-                elif header == list(depth_schema.keys()):
-                    schema = depth_schema
-                elif header == list(book_ticker_schema.keys()):
-                    schema = book_ticker_schema
-            except:
-                # Fails to infer the file type; let Polars infer the schema.
-                pass
+    if grouped_files['book_ticker']:
+        raise ValueError('Use `convert_fuse` instead of `convert` to combine book ticker data with the depth data.')
 
-        df = pl.read_csv(file, schema=schema)
-        if df.columns == list(trade_schema.keys()):
-            arr = (
-                df.with_columns(
-                    pl.when(pl.col('side') == 'buy')
-                        .then(BUY_EVENT | TRADE_EVENT)
-                        .when(pl.col('side') == 'sell')
-                        .then(SELL_EVENT | TRADE_EVENT)
-                        .otherwise(TRADE_EVENT)
-                        .cast(pl.UInt64, strict=True)
-                        .alias('ev'),
-                    (pl.col('timestamp') * 1000)
-                        .cast(pl.Int64, strict=True)
-                        .alias('exch_ts'),
-                    (pl.col('local_timestamp') * 1000)
-                        .cast(pl.Int64, strict=True)
-                        .alias('local_ts'),
-                    pl.col('price')
-                        .cast(pl.Float64, strict=True)
-                        .alias('px'),
-                    pl.col('amount')
-                        .cast(pl.Float64, strict=True)
-                        .alias('qty'),
-                    pl.lit(0)
-                        .cast(pl.UInt64, strict=True)
-                        .alias('order_id'),
-                    pl.lit(0)
-                        .cast(pl.Int64, strict=True)
-                        .alias('ival'),
-                    pl.lit(0.0)
-                        .cast(pl.Float64, strict=True)
-                        .alias('fval')
-                )
-                .select(['ev', 'exch_ts', 'local_ts', 'px', 'qty', 'order_id', 'ival', 'fval'])
-                .to_numpy(structured=True)
-            )
-            tmp[row_num:row_num + len(arr)] = arr[:]
-            row_num += len(arr)
-        elif df.columns == list(depth_schema.keys()):
-            arr = (
-                df.with_columns(
-                    (pl.col('timestamp') * 1000)
-                        .cast(pl.Int64, strict=True)
-                        .alias('exch_ts'),
-                    (pl.col('local_timestamp') * 1000)
-                        .cast(pl.Int64, strict=True)
-                        .alias('local_ts'),
-                    pl.col('price')
-                        .cast(pl.Float64, strict=True)
-                        .alias('px'),
-                    pl.col('amount')
-                        .cast(pl.Float64, strict=True)
-                        .alias('qty'),
-                    pl.when((pl.col('side') == 'bid') | (pl.col('side') == 'buy'))
-                        .then(1)
-                        .when((pl.col('side') == 'ask') | (pl.col('side') == 'sell'))
-                        .then(-1)
-                        .otherwise(0)
-                        .cast(pl.Int8, strict=True)
-                        .alias('side'),
-                    pl.when(pl.col('is_snapshot'))
-                        .then(1)
-                        .otherwise(0)
-                        .cast(pl.Int8, strict=True)
-                        .alias('is_snapshot')
-                )
-                .select(['exch_ts', 'local_ts', 'px', 'qty', 'side', 'is_snapshot'])
-                .to_numpy(structured=True)
-            )
+    print('Reading files...')
+    
+    # Process trades
+    if grouped_files['trades']:
+        trades_arr = _build_trades_lazy(grouped_files['trades']).collect().to_numpy(structured=True)
+        tmp[row_num:row_num + len(trades_arr)] = trades_arr[:]
+        row_num += len(trades_arr)
 
-            snapshot_mode_flag = 0
-            if snapshot_mode == 'ignore':
-                snapshot_mode_flag = SNAPSHOT_MODE_IGNORE
-            elif snapshot_mode == 'ignore_sod':
-                snapshot_mode_flag = SNAPSHOT_MODE_IGNORE_SOD
-            row_num = _convert_depth(tmp, arr, row_num, ss_bid, ss_ask, snapshot_mode_flag)
-        elif df.columns == list(book_ticker_schema.keys()):
-            raise ValueError('Use `convert_fuse` instead of `convert` to combine book ticker data with the depth data.')
+    # Process depth
+    if grouped_files['depth']:
+        # Ensure sorting by timestamp for correct snapshot processing
+        depth_arr = (
+            _build_depth_lazy(grouped_files['depth'])
+            .sort('exch_ts')
+            .collect()
+            .to_numpy(structured=True)
+        )
+        row_num = _convert_depth(tmp, depth_arr, row_num, ss_bid, ss_ask, snapshot_mode_flag)
 
     tmp = tmp[:row_num]
 
